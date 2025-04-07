@@ -29,3 +29,6 @@
     5.4 sandbox cmd1 | cmd2 > file
 
 
+        - 为什么执行到一半，globalRule会出现那么长的count？
+        - 代码无法处理./a.out，因为前面有./
+        - 代码还没有处理好syscall block的情况

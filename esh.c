@@ -12,6 +12,11 @@
 
 #include <errno.h>
 #include <time.h>
+#include <sys/reg.h>
+#include <sys/user.h>
+#include <sys/syscall.h>
+#include <stdbool.h>
+
 
 //
 // You should use the following functions to print information
@@ -78,8 +83,6 @@ enum CHILDRETURN
     MATCHMISS=1,
     ENDUP=0,    
 };
-
-
 const char version[10]="IamMI.v1";
 // Environment variables
 #define MAX_VARS 100
@@ -89,6 +92,44 @@ typedef struct {
 } EnvVar;
 EnvVar my_env_vars[MAX_VARS];
 int var_count = 0;
+
+// Syscall Rule
+#define MAX_RULES 100
+typedef struct {
+    char syscall_name[32];  
+    int arg_index;          
+    char arg_value_str[256]; 
+    long arg_value_int;     
+    int is_string;          
+} SyscallRule;
+
+typedef struct {
+    SyscallRule rules[MAX_RULES];
+    int rule_count;
+} RuleSet;
+
+struct syscall_entry {
+    const char* name;
+    int number;
+};
+struct syscall_entry syscall_table[] = {
+    {"read", SYS_read},
+    {"write", SYS_write},
+    {"open", SYS_open},
+    {"mmap", SYS_mmap},
+    {"pipe", SYS_pipe},
+    {"sched_yield", SYS_sched_yield},
+    {"dup", SYS_dup},
+    {"clone", SYS_clone},
+    {"fork", SYS_fork},
+    {"execve", SYS_execve},
+    {"mkdir", SYS_mkdir},
+    {"chmod", SYS_chmod},
+    {NULL, -1},
+};
+
+
+
 
 
 //
@@ -127,7 +168,7 @@ void errorProcess(char* pos,enum ERROR error,...)
     }
 }
 
-// Pipe determine and extract
+// String process
 void trim(char *str) {
     int start = 0, end = strlen(str) - 1;
     while (isspace((unsigned char)str[start]) && start<=strlen(str) - 1) start++;
@@ -140,7 +181,6 @@ void trim(char *str) {
         str[end + 1] = '\0';
         memmove(str, str + start, end - start + 2);
     }
-
 }
 
 int extractCmds(char *input, char **commands, int *count) {
@@ -210,6 +250,105 @@ void parseArgs(char *input, char **argv) {
         }
     }
     argv[argc] = NULL;
+}
+
+void getDataFromChild(pid_t child, unsigned long addr, char *str, int pathlen) {
+    int i = 0;
+    long data;
+
+    while (i < pathlen) {
+        data = ptrace(PTRACE_PEEKDATA, child, addr + i, NULL);
+        if (data == -1 && errno != 0) break;
+        memcpy(str + i, &data, sizeof(data));
+
+        if (memchr(&data, 0, sizeof(data)) != NULL) break;  
+        i += sizeof(data);
+    }
+
+    str[pathlen - 1] = '\0'; 
+}
+
+// Syscall rule
+int loadRules(char* filename, RuleSet* globalRule) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    char line[512];
+    int flag = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        trim(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+
+        SyscallRule rule;
+        memset(&rule, 0, sizeof(rule));
+
+        // Format: deny:write arg0=xxx
+        char* syscall_part = strtok(line, " ");
+        char* arg_part = strtok(NULL, "#"); 
+
+        if (!syscall_part || !arg_part) continue;
+
+        if (strncmp(syscall_part, "deny:", 5) != 0) continue;
+
+        strcpy(rule.syscall_name, syscall_part + 5);
+        trim(rule.syscall_name);
+
+        trim(arg_part);
+        if (strncmp(arg_part, "arg", 3) == 0) {
+            sscanf(arg_part, "arg%d=%s", &rule.arg_index, rule.arg_value_str);
+            if (rule.arg_value_str[0] == '"' || rule.arg_value_str[0] == '\'') {
+                rule.is_string = 1;
+                size_t len = strlen(rule.arg_value_str);
+                if (rule.arg_value_str[len - 1] == '"' || rule.arg_value_str[len - 1] == '\'')
+                    rule.arg_value_str[len - 1] = '\0';
+                memmove(rule.arg_value_str, rule.arg_value_str + 1, len - 1);
+            } else {
+                rule.is_string = 0;
+                rule.arg_value_int = atol(rule.arg_value_str);
+            }
+        }
+        else{
+            rule.arg_index = -1;
+        }
+
+        if (globalRule->rule_count < MAX_RULES) {
+            globalRule->rules[globalRule->rule_count++] = rule;
+        }
+    }
+
+    fclose(fp);
+
+    return 0;
+}
+
+int getSyscallNumber(const char* name) {
+    for (int i = 0; syscall_table[i].name != NULL; i++) {
+        if (strcmp(name, syscall_table[i].name) == 0) {
+            return syscall_table[i].number;
+        }
+    }
+    return -1;
+}
+
+unsigned long getRegisterArg(int argIndex, struct user_regs_struct regs) {
+    switch(argIndex) {
+        case 0:
+            return regs.rdi;
+        case 1:
+            return regs.rsi;
+        case 2:
+            return regs.rdx;
+        case 3:
+            return regs.r10;
+        case 4:
+            return regs.r8;
+        case 5:
+            return regs.r9;
+        default:
+            return -1;
+    }
 }
 
 // Innercmd determine
@@ -338,37 +477,103 @@ int waitpidTimeout(pid_t pid, int* status, int timeout){
     return 0;
 }
 
-void ParseChildReturn(pid_t pid){
-    int status;
-    if(waitpidTimeout(pid, &status, 3)!=0){
-        // Timeout
-        errorProcess("waitpid timeout", EXECERROR);
-        return;
-    }
+int syscallBlock(pid_t pid, RuleSet* globalRule){
+    //
+    //  Parse child for syscall
+    //
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    
+    // Traverse globalRule
+    for(int index=0; index<globalRule->rule_count; index++){
+        int syscallNumber = getSyscallNumber(globalRule->rules[index].syscall_name);
 
-    if (WIFEXITED(status)) {
-        int exit_code = WEXITSTATUS(status);
-        switch(exit_code){
-            case ENDUP:
-                // cmd end up
-                break;
-            case MATCHMISS:
-                // cmd match miss
-                break;
-            case ARGERROR:
-                // cmd's args illegal
-                errorProcess("Cmds input args illegal!", SYNTAXINVALID);
-                break;
-            case MEANINGLESS:
-                // cmd non-executable
-                errorProcess("Cmds non-executable!", COMMANDNOTFOUND);
-                break;
-            case RUNNINGERROR:
-                errorProcess("Cmds running error!", EXECERROR);
-                break;
-            default:
-                errorProcess("New error occur at externalCmd!", EXECERROR);
-                break;
+        if (regs.orig_rax == syscallNumber) {
+            if(globalRule->rules[index].arg_index==-1){
+                // Shut down
+                printf("Blocked from pid %d\n", pid);
+            }
+            else{
+                // 1. obtain user input string addr
+                unsigned long addr = getRegisterArg(globalRule->rules[index].arg_index, regs);
+                if(addr == -1){
+                    printf("Debug, addr error");
+                }
+                // 2. obtain user input args
+                if(globalRule->rules[index].is_string){
+                    // 3. compare
+                    if(!strncmp((char*)addr, globalRule->rules[index].arg_value_str, sizeof(globalRule->rules[index].arg_value_str))){
+                        // Shut down
+                        // printf("Blocked from pid %d\n", pid);
+                        return 1;
+                    }
+                }
+                else{
+                    if(addr==globalRule->rules[index].arg_value_int){
+                        // Shut down
+                        // printf("Blocked from pid %d\n", pid);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule){
+    int status;
+    // if(waitpidTimeout(pid, &status, 3)!=0){
+    //     // Timeout
+    //     errorProcess("waitpid timeout", EXECERROR);
+    //     return;
+    // }
+    int finished = 0;
+    while (finished < count) {
+        pid_t pid = waitpid(-1, &status, __WALL);
+        if (pid == -1) break;
+
+        // Exit
+        if (WIFEXITED(status)) {
+            finished++;
+            // Exit code
+            int exit_code = WEXITSTATUS(status);
+            switch(exit_code){
+                case ENDUP:
+                    // cmd end up
+                    break;
+                case MATCHMISS:
+                    // cmd match miss
+                    break;
+                case ARGERROR:
+                    // cmd's args illegal
+                    errorProcess("Cmds input args illegal!", SYNTAXINVALID);
+                    break;
+                case MEANINGLESS:
+                    // cmd non-executable
+                    errorProcess("Cmds non-executable!", COMMANDNOTFOUND);
+                    break;
+                case RUNNINGERROR:
+                    errorProcess("Cmds running error!", EXECERROR);
+                    break;
+                default:
+                    errorProcess("New error occur at externalCmd!", EXECERROR);
+                    break;
+            }
+            continue;
+        }
+
+        // Syscall
+        if(sandbox){
+            if (WIFSTOPPED(status)) {
+                if(syscallBlock(pid, globalRule)){
+                    // Block
+                    // errorProcess("Syscall block", SYSCALLBLOCK);
+                    printf("Syscall block!\n");
+
+                }
+                ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+            }
         }
     }
 }
@@ -437,12 +642,21 @@ void externalCmd(char* cmd){
     exit(ENDUP);
 }
 
-void externalCmds(char** cmds, int count){
+void externalCmds(char** cmds, int count, bool sandbox, ...){
     //
     //  Fork progress to execute cmds
     //  Responds for error processing 
     //
 
+    // sandbox detection
+    RuleSet* globalRule;
+    if(sandbox){
+        va_list args;
+        va_start(args, sandbox);
+        globalRule = va_arg(args, RuleSet*);
+        va_end(args);
+    }
+    
     int i;
     int pipefd[2*(count-1)];  
     int pids[count];
@@ -477,9 +691,14 @@ void externalCmds(char** cmds, int count){
             for (int j=0; j<2*(count-1); j++) {
                 close(pipefd[j]);
             }
-            // 3. execute cmd
+            // 3. ptrace
+            if(sandbox){
+                ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+                kill(getpid(), SIGSTOP); 
+            }
+            // 4. execute cmd
             externalCmd(cmds[i]);
-            // 4. endup
+            // 5. endup
             exit(ENDUP);
         }
         else{
@@ -492,10 +711,8 @@ void externalCmds(char** cmds, int count){
     for (i=0; i<2*(count-1); i++) {
         close(pipefd[i]);
     }
-    // 2. wait for all child and parse their exit_code
-    for(i=0; i<count; i++){
-        ParseChildReturn(pids[i]);
-    }
+    // 2. wait for all child and parse their syscall and exit code
+    ParseChildReturn(pids, count, sandbox, globalRule);
 
 }   
 
@@ -506,6 +723,33 @@ void commandAnalysis(char* input)
     //  Analyse input command, carry out and process error
     //
     
+
+    trim(input);
+    // Sandbox detection
+    bool sandbox = false;
+    RuleSet* globalRule = malloc(sizeof(RuleSet));
+
+    if(!strncmp(input, "sandbox ", 8)){
+        // Extract rules
+        input += 8;
+        char* space = strchr(input, ' ');
+        if(!*space){
+            errorProcess("Input error", SYNTAXINVALID);
+            return ;
+        }
+        *space = '\0';
+        char* rule = input;
+        input = space+1;
+        // Load rules
+        if(loadRules(rule, globalRule)==-1){
+            errorProcess("loadRule error", EXECERROR);
+            return;
+        }
+        sandbox = true;
+    }
+
+
+
     // Determine how many commands aside pipes exist
     char** commands;
     int count=1;
@@ -550,13 +794,23 @@ void commandAnalysis(char* input)
                 env(commands[0]);
                 break;
             default:
-                externalCmds(commands, count);
+                if(sandbox)
+                    externalCmds(commands, count, true, globalRule);
+                else 
+                    externalCmds(commands, count, false);
                 break;
         }
     }
     else{
-        externalCmds(commands, count);
+        if(sandbox)
+            externalCmds(commands, count, true, globalRule);
+        else 
+            externalCmds(commands, count, false);
     }
+
+    free(globalRule);
+
+
 }
 
 
