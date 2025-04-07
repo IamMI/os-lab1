@@ -142,7 +142,7 @@ void errorProcess(char* pos,enum ERROR error,...)
     // 
     //  To process all error
     //
-    printf("Sometime catch error: %s!\n", pos);
+    // printf("Sometime catch error: %s!\n", pos);
     switch(error){
         case SYNTAXINVALID:
             print_invalid_syntax();
@@ -158,6 +158,7 @@ void errorProcess(char* pos,enum ERROR error,...)
             va_start(args, error);
             char* syscall_name = va_arg(args, char*);
             int count = va_arg(args, int);
+
             print_blocked_syscall(syscall_name, count, args);
             va_end(args);
             break;
@@ -332,6 +333,15 @@ int getSyscallNumber(const char* name) {
     return -1;
 }
 
+const char* getSyscallName(int num){
+    for (int i = 0; syscall_table[i].name != NULL; i++) {
+        if (num == syscall_table[i].number) {
+            return syscall_table[i].name;
+        }
+    }
+    return NULL;
+}
+
 unsigned long getRegisterArg(int argIndex, struct user_regs_struct regs) {
     switch(argIndex) {
         case 0:
@@ -504,14 +514,12 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
                     // 3. compare
                     if(!strncmp((char*)addr, globalRule->rules[index].arg_value_str, sizeof(globalRule->rules[index].arg_value_str))){
                         // Shut down
-                        // printf("Blocked from pid %d\n", pid);
                         return 1;
                     }
                 }
                 else{
                     if(addr==globalRule->rules[index].arg_value_int){
                         // Shut down
-                        // printf("Blocked from pid %d\n", pid);
                         return 1;
                     }
                 }
@@ -523,11 +531,6 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
 
 void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule){
     int status;
-    // if(waitpidTimeout(pid, &status, 3)!=0){
-    //     // Timeout
-    //     errorProcess("waitpid timeout", EXECERROR);
-    //     return;
-    // }
     int finished = 0;
     while (finished < count) {
         pid_t pid = waitpid(-1, &status, __WALL);
@@ -568,9 +571,12 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
             if (WIFSTOPPED(status)) {
                 if(syscallBlock(pid, globalRule)){
                     // Block
-                    // errorProcess("Syscall block", SYSCALLBLOCK);
-                    printf("Syscall block!\n");
-
+                    struct user_regs_struct regs;
+                    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+                    errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), 1, regs.rdi);
+                    kill(pid, SIGKILL);
+                    finished++;
+                    continue;
                 }
                 ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
             }
