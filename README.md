@@ -1,34 +1,18 @@
-1. One cmd
-    1.1 Inner cmd
-    1.2 External cmd
+We ask ChatGPT for generating testing cmds and record error case
+    1. "ls | | cat" raise "Command Not Found" instead of "Invalid Syntax" √
+    2. "> only" do not raise error √
+    3. "cat nonexistentfile.txt " do not raise error √
+    4. "ls /root/secret " raise "Invalid Syntax" instead of "Execution Error" √
+    5. "rm" do not raise error √
+    6. "export " do not raise error "Invalid Syntax" √
+    7. "sandbox rule.txt ls" do not raise error when "deny:read" √
 
-2. Multi-cmds with pipe
-    2.1 cmd1 | cmd2
-    2.2 cmd1 | cmd2 | cmd3 
-    2.3 inner-cmd | cmd1
-    2.4 cmd1 | inner-cmd
-    2.5 cmd1 | inner-cmd | cmd2
-    
-3. Redirection
-    3.1 cmd1 > file
-    3.2 cmd1 | cmd2 > file
-    3.3 cmd1 > file | cmd2
-    3.4 cmd1 > file | inner-cmd
-
-        - "echo hello > out.txt > another.txt"不支持连续重定向
         
+This part contains vague definitions
+    1. "cd " is error or not?
+    2. "foo | bar" raise one error or two?
+    3. "yes | head -n 5" do not raise error, however, demo raise "Execution Error"
+    4. 
 
-
-4. Error
-    4.1 syntax error
-
-5. Sandbox
-    5.1 sandbox cmd1 
-    5.2 sandbox cmd1 | cmd2
-    5.3 sandbox cmd1 > file | cmd2
-    5.4 sandbox cmd1 | cmd2 > file
-
-
-        - 为什么执行到一半，globalRule会出现那么长的count？
-        - 代码无法处理./a.out，因为前面有./
-        - 代码还没有处理好syscall block的情况
+Potential error
+    1. Divide cmd just using detect '|' may fail sometime

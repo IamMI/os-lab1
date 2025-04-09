@@ -77,11 +77,11 @@ enum INNERCMD
 };
 enum CHILDRETURN
 {
-    RUNNINGERROR=4,
-    MEANINGLESS=3,
-    ARGERROR=2,
+    ENDUP=0,
     MATCHMISS=1,
-    ENDUP=0,    
+    ARGERROR=2,
+    MEANINGLESS=3,
+    RUNNINGERROR=4,     
 };
 const char version[10]="IamMI.v1";
 // Environment variables
@@ -111,21 +111,22 @@ typedef struct {
 struct syscall_entry {
     const char* name;
     int number;
+    int paramNum;
 };
 struct syscall_entry syscall_table[] = {
-    {"read", SYS_read},
-    {"write", SYS_write},
-    {"open", SYS_open},
-    {"mmap", SYS_mmap},
-    {"pipe", SYS_pipe},
-    {"sched_yield", SYS_sched_yield},
-    {"dup", SYS_dup},
-    {"clone", SYS_clone},
-    {"fork", SYS_fork},
-    {"execve", SYS_execve},
-    {"mkdir", SYS_mkdir},
-    {"chmod", SYS_chmod},
-    {NULL, -1},
+    {"read", SYS_read, 3},
+    {"write", SYS_write, 3},
+    {"open", SYS_open, 3},
+    {"mmap", SYS_mmap, 6},
+    {"pipe", SYS_pipe, 1},
+    {"sched_yield", SYS_sched_yield, 0},
+    {"dup", SYS_dup, 1},
+    {"clone", SYS_clone, 5},
+    {"fork", SYS_fork, 0},
+    {"execve", SYS_execve, 3},
+    {"mkdir", SYS_mkdir, 2},
+    {"chmod", SYS_chmod, 2},
+    {NULL, -1, -1},
 };
 
 
@@ -137,6 +138,93 @@ struct syscall_entry syscall_table[] = {
 //
 
 // Error Process
+
+int _isStringPointer(unsigned long addr) {
+    return addr > 0x10000 && addr < 0x7fffffffffff;
+}
+
+char* _readStringFromTracee(pid_t pid, unsigned long addr) {
+    static char buf[256];
+    memset(buf, 0, sizeof(buf));
+    int i = 0;
+    long word;
+
+    while (i < sizeof(buf)) {
+        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
+        if (word == -1) break;
+        memcpy(buf + i, &word, sizeof(word));
+        if (memchr(&word, 0, sizeof(word))) break;
+        i += sizeof(word);
+    }
+
+    char* result = malloc(300);
+    snprintf(result, 300, "\"%s\"", buf);
+    return result;
+}
+
+char* formatArg(pid_t pid, unsigned long val) {
+    char* result = malloc(64);
+
+    if (_isStringPointer(val)) {
+        char* str = _readStringFromTracee(pid, val);
+        if (str) return str;
+    }
+    
+    if (val <= 0xffff) {
+        snprintf(result, 64, "%lu", val);
+    } else {
+        snprintf(result, 64, "0x%lx", val);
+    }
+
+    return result;
+}
+
+void dispatchSyscallArgs(const char* syscall_name, struct user_regs_struct regs, int count, pid_t pid) {
+    char* args[6];
+    switch (count) {
+        case 6:
+            args[5] = formatArg(pid, regs.r9);
+        case 5:
+            args[4] = formatArg(pid, regs.r8);
+        case 4:
+            args[3] = formatArg(pid, regs.r10);
+        case 3:
+            args[2] = formatArg(pid, regs.rdx);
+        case 2:
+            args[1] = formatArg(pid, regs.rsi);
+        case 1:
+            args[0] = formatArg(pid, regs.rdi);
+        case 0:
+            break;
+        default:
+            printf("dispatchSyscallArgs error!\n");
+            return;
+    }
+
+    
+    switch (count) {
+        case 0:
+            print_blocked_syscall((char*)syscall_name, 0); break;
+        case 1:
+            print_blocked_syscall((char*)syscall_name, 1, args[0]); break;
+        case 2:
+            print_blocked_syscall((char*)syscall_name, 2, args[0], args[1]); break;
+        case 3:
+            print_blocked_syscall((char*)syscall_name, 3, args[0], args[1], args[2]); break;
+        case 4:
+            print_blocked_syscall((char*)syscall_name, 4, args[0], args[1], args[2], args[3]); break;
+        case 5:
+            print_blocked_syscall((char*)syscall_name, 5, args[0], args[1], args[2], args[3], args[4]); break;
+        case 6:
+            print_blocked_syscall((char*)syscall_name, 6, args[0], args[1], args[2], args[3], args[4], args[5]); break;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        free(args[i]);
+    }
+}
+
+
 void errorProcess(char* pos,enum ERROR error,...)
 {
     // 
@@ -158,8 +246,10 @@ void errorProcess(char* pos,enum ERROR error,...)
             va_start(args, error);
             char* syscall_name = va_arg(args, char*);
             int count = va_arg(args, int);
+            struct user_regs_struct regs = va_arg(args, struct user_regs_struct);
+            pid_t pid = va_arg(args, pid_t);
 
-            print_blocked_syscall(syscall_name, count, args);
+            dispatchSyscallArgs(syscall_name, regs, count, pid);
             va_end(args);
             break;
         }
@@ -289,31 +379,35 @@ int loadRules(char* filename, RuleSet* globalRule) {
         char* syscall_part = strtok(line, " ");
         char* arg_part = strtok(NULL, "#"); 
 
-        if (!syscall_part || !arg_part) continue;
+        if (!syscall_part) continue;
 
         if (strncmp(syscall_part, "deny:", 5) != 0) continue;
 
         strcpy(rule.syscall_name, syscall_part + 5);
         trim(rule.syscall_name);
 
-        trim(arg_part);
-        if (strncmp(arg_part, "arg", 3) == 0) {
-            sscanf(arg_part, "arg%d=%s", &rule.arg_index, rule.arg_value_str);
-            if (rule.arg_value_str[0] == '"' || rule.arg_value_str[0] == '\'') {
-                rule.is_string = 1;
-                size_t len = strlen(rule.arg_value_str);
-                if (rule.arg_value_str[len - 1] == '"' || rule.arg_value_str[len - 1] == '\'')
-                    rule.arg_value_str[len - 1] = '\0';
-                memmove(rule.arg_value_str, rule.arg_value_str + 1, len - 1);
-            } else {
-                rule.is_string = 0;
-                rule.arg_value_int = atol(rule.arg_value_str);
+
+        if(arg_part){
+            trim(arg_part);
+            if (strncmp(arg_part, "arg", 3) == 0) {
+                sscanf(arg_part, "arg%d=%s", &rule.arg_index, rule.arg_value_str);
+                if (rule.arg_value_str[0] == '"' || rule.arg_value_str[0] == '\'') {
+                    rule.is_string = 1;
+                    size_t len = strlen(rule.arg_value_str);
+                    if (rule.arg_value_str[len - 1] == '"' || rule.arg_value_str[len - 1] == '\'')
+                        rule.arg_value_str[len - 1] = '\0';
+                    memmove(rule.arg_value_str, rule.arg_value_str + 1, len - 1);
+                } else {
+                    rule.is_string = 0;
+                    rule.arg_value_int = atol(rule.arg_value_str);
+                }
             }
+            else continue;
         }
         else{
             rule.arg_index = -1;
         }
-
+        
         if (globalRule->rule_count < MAX_RULES) {
             globalRule->rules[globalRule->rule_count++] = rule;
         }
@@ -429,6 +523,7 @@ void export(char* input){
     char spaceKey=' ';
     envValue = &spaceKey;
 
+
     if (pos) {
         envValue = strdup(pos+1);
         *pos = '\0'; 
@@ -437,14 +532,20 @@ void export(char* input){
         trim(envValue);
     } 
     else{
+        // clean
+        trim(c);
+        if(!strlen(c)){
+            errorProcess("export space", SYNTAXINVALID);
+            return;
+        }
+
         envName = strdup(c);
         trim(envName);
-        
     }
 
-    // 2. set env value
+    // 3. set env value
     setenv(envName, envValue, 1);
-    // 3. Store 
+    // 4. Store 
     for (int i = 0; i < var_count; i++) {
         if (strcmp(my_env_vars[i].name, envName) == 0) {
             strcpy(my_env_vars[i].value, envValue);
@@ -499,15 +600,18 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
         int syscallNumber = getSyscallNumber(globalRule->rules[index].syscall_name);
 
         if (regs.orig_rax == syscallNumber) {
+            
             if(globalRule->rules[index].arg_index==-1){
                 // Shut down
-                printf("Blocked from pid %d\n", pid);
+                
+                return 1;
             }
             else{
                 // 1. obtain user input string addr
                 unsigned long addr = getRegisterArg(globalRule->rules[index].arg_index, regs);
                 if(addr == -1){
-                    printf("Debug, addr error");
+                    errorProcess("syscallBlock, addr fail", EXECERROR);
+                    return 1;
                 }
                 // 2. obtain user input args
                 if(globalRule->rules[index].is_string){
@@ -547,6 +651,7 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                     break;
                 case MATCHMISS:
                     // cmd match miss
+                    errorProcess("Cmds match miss!", EXECERROR);
                     break;
                 case ARGERROR:
                     // cmd's args illegal
@@ -573,7 +678,7 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                     // Block
                     struct user_regs_struct regs;
                     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-                    errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), 1, regs.rdi);
+                    errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), syscall_table[regs.orig_rax].paramNum, regs, pid);
                     kill(pid, SIGKILL);
                     finished++;
                     continue;
@@ -729,7 +834,6 @@ void commandAnalysis(char* input)
     //  Analyse input command, carry out and process error
     //
     
-
     trim(input);
     // Sandbox detection
     bool sandbox = false;
@@ -775,7 +879,7 @@ void commandAnalysis(char* input)
     // Extract commands aside pipes
     if(extractCmds(input, commands, &count)==-1){
         // Extract space-key
-        errorProcess("extractCmds, catch space-key!", COMMANDNOTFOUND);
+        errorProcess("extractCmds, catch space-key!", SYNTAXINVALID);
         return;
     }
 
@@ -852,6 +956,5 @@ int main(void)
         getline(&input,&MAXLINE,stdin);
         // Analyse and execute
         commandAnalysis(input);
-        
     }
 }
