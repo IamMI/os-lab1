@@ -873,8 +873,6 @@ void commandAnalysis(char* input)
         sandbox = true;
     }
 
-
-
     // Determine how many commands aside pipes exist
     char** commands;
     int count=1;
