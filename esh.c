@@ -224,7 +224,6 @@ void dispatchSyscallArgs(const char* syscall_name, struct user_regs_struct regs,
     }
 }
 
-
 void errorProcess(char* pos,enum ERROR error,...)
 {
     // 
@@ -603,7 +602,6 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
             
             if(globalRule->rules[index].arg_index==-1){
                 // Shut down
-                
                 return 1;
             }
             else{
@@ -675,7 +673,6 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
         if(sandbox){
             if (WIFSTOPPED(status)) {
                 if(syscallBlock(pid, globalRule)){
-                    // Block
                     struct user_regs_struct regs;
                     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
                     errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), syscall_table[regs.orig_rax].paramNum, regs, pid);
