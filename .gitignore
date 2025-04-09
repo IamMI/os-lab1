@@ -6,7 +6,6 @@
 *.asm
 esh
 conf/info.mk
-*.pdf
 *.zip
 a/*
 rule.txt
