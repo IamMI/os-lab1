@@ -96,11 +96,16 @@ int var_count = 0;
 // Syscall Rule
 #define MAX_RULES 100
 typedef struct {
-    char syscall_name[32];  
     int arg_index;          
     char arg_value_str[256]; 
     long arg_value_int;     
-    int is_string;          
+    int is_string;  
+} SyscallArgs;
+
+typedef struct {
+    char syscall_name[32];  
+    int args_count;
+    SyscallArgs args[6];
 } SyscallRule;
 
 typedef struct {
@@ -385,26 +390,37 @@ int loadRules(char* filename, RuleSet* globalRule) {
         strcpy(rule.syscall_name, syscall_part + 5);
         trim(rule.syscall_name);
 
-
+        
         if(arg_part){
             trim(arg_part);
-            if (strncmp(arg_part, "arg", 3) == 0) {
-                sscanf(arg_part, "arg%d=%s", &rule.arg_index, rule.arg_value_str);
-                if (rule.arg_value_str[0] == '"' || rule.arg_value_str[0] == '\'') {
-                    rule.is_string = 1;
-                    size_t len = strlen(rule.arg_value_str);
-                    if (rule.arg_value_str[len - 1] == '"' || rule.arg_value_str[len - 1] == '\'')
-                        rule.arg_value_str[len - 1] = '\0';
-                    memmove(rule.arg_value_str, rule.arg_value_str + 1, len - 1);
-                } else {
-                    rule.is_string = 0;
-                    rule.arg_value_int = atol(rule.arg_value_str);
+            // Divide
+            char *arg = strtok(arg_part, " ");
+            int count = 0;
+            while (arg != NULL) {
+                trim(arg);
+                if (strncmp(arg, "arg", 3) == 0) {
+                    sscanf(arg, "arg%d=%s", &rule.args[count].arg_index, rule.args[count].arg_value_str);
+                    trim(rule.args[count].arg_value_str);
+
+                    if (rule.args[count].arg_value_str[0] == '"' || rule.args[count].arg_value_str[0] == '\'') {
+                        rule.args[count].is_string = 1;
+                        size_t len = strlen(rule.args[count].arg_value_str);
+                        if (rule.args[count].arg_value_str[len - 1] == '"' || rule.args[count].arg_value_str[len - 1] == '\'')
+                            rule.args[count].arg_value_str[len - 1] = '\0';
+                        memmove(rule.args[count].arg_value_str, rule.args[count].arg_value_str + 1, len - 1);
+                    } else {
+                        rule.args[count].is_string = 0;
+                        rule.args[count].arg_value_int = atol(rule.args[count].arg_value_str);
+                    }
+                    count ++;
                 }
+                else continue;
+                arg = strtok(NULL, " ");
             }
-            else continue;
+            rule.args_count = count;
         }
         else{
-            rule.arg_index = -1;
+            rule.args_count = 0;
         }
         
         if (globalRule->rule_count < MAX_RULES) {
@@ -600,29 +616,31 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
 
         if (regs.orig_rax == syscallNumber) {
             
-            if(globalRule->rules[index].arg_index==-1){
+            if(globalRule->rules[index].args_count==0){
                 // Shut down
                 return 1;
             }
             else{
-                // 1. obtain user input string addr
-                unsigned long addr = getRegisterArg(globalRule->rules[index].arg_index, regs);
-                if(addr == -1){
-                    errorProcess("syscallBlock, addr fail", EXECERROR);
-                    return 1;
-                }
-                // 2. obtain user input args
-                if(globalRule->rules[index].is_string){
-                    // 3. compare
-                    if(!strncmp((char*)addr, globalRule->rules[index].arg_value_str, sizeof(globalRule->rules[index].arg_value_str))){
-                        // Shut down
+                for(int i=0; i<globalRule->rules[index].args_count; i++){
+                    // 1. obtain user input string addr
+                    unsigned long addr = getRegisterArg(globalRule->rules[index].args[i].arg_index, regs);
+                    if(addr == -1){
+                        errorProcess("syscallBlock, addr fail", EXECERROR);
                         return 1;
                     }
-                }
-                else{
-                    if(addr==globalRule->rules[index].arg_value_int){
-                        // Shut down
-                        return 1;
+                    // 2. obtain user input args
+                    if(globalRule->rules[index].args[i].is_string){
+                        // 3. compare
+                        if(!strncmp((char*)addr, globalRule->rules[index].args[i].arg_value_str, sizeof(globalRule->rules[index].args[i].arg_value_str))){
+                            // Shut down
+                            return 1;
+                        }
+                    }
+                    else{
+                        if(addr==globalRule->rules[index].args[i].arg_value_int){
+                            // Shut down
+                            return 1;
+                        }
                     }
                 }
             }
