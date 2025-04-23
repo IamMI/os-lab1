@@ -128,7 +128,7 @@ struct syscall_entry syscall_table[] = {
     {"dup", SYS_dup, 1},
     {"clone", SYS_clone, 5},
     {"fork", SYS_fork, 0},
-    {"execve", SYS_execve, 3},
+    {"execve", SYS_execve, 1},
     {"mkdir", SYS_mkdir, 2},
     {"chmod", SYS_chmod, 2},
     {NULL, -1, -1},
@@ -286,7 +286,6 @@ int extractCmds(char *input, char **commands, int *count) {
     char *token = input;
     int i = 0;
 
-
     if(*count>1)
         while (token) {
             char *pipe_pos = strchr(token, '|');
@@ -294,6 +293,10 @@ int extractCmds(char *input, char **commands, int *count) {
                 // Intermediate cmd
                 *pipe_pos = '\0'; 
                 commands[i] = strdup(token);
+                if(strlen(commands[i])==0){
+                    // Consective pipeline
+                    return -2;
+                }
                 trim(commands[i]);
                 if(strlen(commands[i])==0){
                     // Blank cmd
@@ -451,6 +454,15 @@ const char* getSyscallName(int num){
     return NULL;
 }
 
+int getSyscallCount(int num){
+    for (int i = 0; syscall_table[i].name != NULL; i++) {
+        if (num == syscall_table[i].number) {
+            return syscall_table[i].paramNum;
+        }
+    }
+    return -1;
+}
+
 unsigned long getRegisterArg(int argIndex, struct user_regs_struct regs) {
     switch(argIndex) {
         case 0:
@@ -485,10 +497,10 @@ enum INNERCMD innerCmdDeter(char *cmd){
         // printf("cmd: export\n");
         return EXPORT;
     }
-    else if(!strncmp(cmd, "env", 3) && strlen(cmd)==3){
-        // printf("cmd: env\n");
-        return ENV;
-    }
+    // else if(!strncmp(cmd, "env", 3) && strlen(cmd)==3){
+    //     // printf("cmd: env\n");
+    //     return ENV;
+    // }
     else{
         return -1;
     }
@@ -671,7 +683,7 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                     break;
                 case ARGERROR:
                     // cmd's args illegal
-                    errorProcess("Cmds input args illegal!", SYNTAXINVALID);
+                    errorProcess("Cmds input args illegal!", EXECERROR);
                     break;
                 case MEANINGLESS:
                     // cmd non-executable
@@ -693,7 +705,8 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                 if(syscallBlock(pid, globalRule)){
                     struct user_regs_struct regs;
                     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-                    errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), syscall_table[regs.orig_rax].paramNum, regs, pid);
+
+                    errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), getSyscallCount(regs.orig_rax), regs, pid);
                     kill(pid, SIGKILL);
                     finished++;
                     continue;
@@ -715,7 +728,8 @@ void externalCmd(char* cmd){
     // 2. Avoid inner instruction
     if(innerCmdDeter(cmd)!=-1) exit(ENDUP);
     // 3. Find out redirection
-    char* redirect_pos = NULL;
+    char* redirects[8] ;
+    int redirect_count = 0;
     int in_quote = 0;
     char quote_char = '\0';
 
@@ -735,35 +749,45 @@ void externalCmd(char* cmd){
                 exit(ARGERROR);
             }
             // ">" -> redirect
-            redirect_pos = p;
-            break;
+            // redirect_pos = p;
+            // break;
+            *p = '\0';  // 分隔 cmd
+            char* filename = p + 1;
+            redirects[redirect_count++] = filename;
+            
         }
         else if(*p == '<' && in_quote == 0){
             // "<" -> Invalid syntax
             exit(ARGERROR);
         }
     }
-
+    
     char* argv[32];
-    if (redirect_pos) {
-        // 4. Divide
-        *redirect_pos = '\0';
-        char* filename = redirect_pos + 1;
-        trim(cmd);        
-        trim(filename);   
-
-        // 5. Open file and redirect
-        int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
+    int fd = -1;
+    for (int i = 0; i < redirect_count; ++i) {
+        trim(redirects[i]);
+        int tmpfd = open(redirects[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (tmpfd < 0) {
             exit(RUNNINGERROR);
         }
-        dup2(fd, STDOUT_FILENO);
-        close(fd);
+        if (i == redirect_count - 1) {
+            dup2(tmpfd, STDOUT_FILENO);
+        }
+        close(tmpfd); 
     }
 
-    parseArgs(cmd, argv);  
-    if (execvp(argv[0], argv) == -1) {
-        exit(MEANINGLESS);
+    parseArgs(cmd, argv); 
+
+    if (strcmp(argv[0], "env") == 0 && argv[1] == NULL) {
+        // env
+        env(NULL);
+        exit(ENDUP);
+    } 
+    else{
+        if (execvp(argv[0], argv) == -1) {
+            // Command not found
+            exit(MEANINGLESS);
+        }
     }
     exit(ENDUP);
 }
@@ -890,9 +914,15 @@ void commandAnalysis(char* input)
     }
 
     // Extract commands aside pipes
-    if(extractCmds(input, commands, &count)==-1){
+    int exitcode = extractCmds(input, commands, &count);
+    if(exitcode == -1){
         // Extract space-key
-        errorProcess("extractCmds, catch space-key!", SYNTAXINVALID);
+        errorProcess("extractCmds, catch space-key!", COMMANDNOTFOUND);
+        return;
+    }
+    else if(exitcode == -2){
+        // Extract consecutive pipeline
+        errorProcess("extractCmds, catch consecutive pipeline!", SYNTAXINVALID);
         return;
     }
 
@@ -912,9 +942,6 @@ void commandAnalysis(char* input)
                 break;
             case EXPORT:
                 export(commands[0]);
-                break;
-            case ENV:
-                env(commands[0]);
                 break;
             default:
                 if(sandbox)
@@ -966,7 +993,11 @@ int main(void)
         // Receive input
         char *input=(char*)malloc(50);
         // input = "hello | good | bye";
-        getline(&input,&MAXLINE,stdin);
+        if(getline(&input,&MAXLINE,stdin)==-1){
+            // Ctrl+D
+            exit(0);
+        }
+        
         // Analyse and execute
         commandAnalysis(input);
     }
