@@ -683,7 +683,7 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                     break;
                 case ARGERROR:
                     // cmd's args illegal
-                    errorProcess("Cmds input args illegal!", EXECERROR);
+                    errorProcess("Cmds input args illegal!", SYNTAXINVALID);
                     break;
                 case MEANINGLESS:
                     // cmd non-executable
@@ -754,7 +754,6 @@ void externalCmd(char* cmd){
             *p = '\0';  // 分隔 cmd
             char* filename = p + 1;
             redirects[redirect_count++] = filename;
-            
         }
         else if(*p == '<' && in_quote == 0){
             // "<" -> Invalid syntax
