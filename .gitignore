@@ -9,4 +9,5 @@ conf/info.mk
 *.zip
 a/*
 rule.txt
+b/*
 

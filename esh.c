@@ -16,7 +16,8 @@
 #include <sys/user.h>
 #include <sys/syscall.h>
 #include <stdbool.h>
-
+#include <setjmp.h>
+#include <signal.h>
 
 //
 // You should use the following functions to print information
@@ -133,9 +134,6 @@ struct syscall_entry syscall_table[] = {
     {"chmod", SYS_chmod, 2},
     {NULL, -1, -1},
 };
-
-
-
 
 
 //
@@ -262,6 +260,24 @@ void errorProcess(char* pos,enum ERROR error,...)
             break;
     }
 }
+
+// jmp_buf __env;
+
+// void handler(int sig) {
+//     longjmp(__env, 1);
+// }
+
+// int is_pointer_valid(void *ptr) {
+//     signal(SIGSEGV, handler);
+//     if (setjmp(__env)) {
+//         // 非法访问
+//         return 0;
+//     } else {
+//         volatile char c = *(char *)ptr;
+//         (void)c;
+//         return 1;
+//     }
+// }
 
 // String process
 void trim(char *str) {
@@ -482,6 +498,26 @@ unsigned long getRegisterArg(int argIndex, struct user_regs_struct regs) {
     }
 }
 
+char *readStringFromPid(pid_t pid, unsigned long addr) {
+    char *str = malloc(4096); 
+    int i = 0;
+    long word;
+
+    while (1) {
+        errno = 0;
+        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
+        if (errno != 0) break;
+
+        memcpy(str + i, &word, sizeof(word));
+
+        if (memchr(&word, 0, sizeof(word)) != NULL) break;
+
+        i += sizeof(word);
+    }
+
+    return str;
+}
+
 // Innercmd determine
 enum INNERCMD innerCmdDeter(char *cmd){
     // cd
@@ -627,12 +663,12 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
         int syscallNumber = getSyscallNumber(globalRule->rules[index].syscall_name);
 
         if (regs.orig_rax == syscallNumber) {
-            
             if(globalRule->rules[index].args_count==0){
                 // Shut down
                 return 1;
             }
             else{
+                int flag=0;
                 for(int i=0; i<globalRule->rules[index].args_count; i++){
                     // 1. obtain user input string addr
                     unsigned long addr = getRegisterArg(globalRule->rules[index].args[i].arg_index, regs);
@@ -640,20 +676,31 @@ int syscallBlock(pid_t pid, RuleSet* globalRule){
                         errorProcess("syscallBlock, addr fail", EXECERROR);
                         return 1;
                     }
+                    
                     // 2. obtain user input args
                     if(globalRule->rules[index].args[i].is_string){
-                        // 3. compare
-                        if(!strncmp((char*)addr, globalRule->rules[index].args[i].arg_value_str, sizeof(globalRule->rules[index].args[i].arg_value_str))){
-                            // Shut down
-                            return 1;
-                        }
+                        // 2.1 read string from regs
+                        char* string = readStringFromPid(pid, addr);
+
+                        if(string != NULL)
+                            if(strlen(globalRule->rules[index].args[i].arg_value_str)==strlen(string))
+                                // 3. compare
+                                if(!strncmp(string, globalRule->rules[index].args[i].arg_value_str, strlen(globalRule->rules[index].args[i].arg_value_str))){
+                                    free(string);
+                                    flag += 1;
+                                    continue;
+                                }
+                        free(string);
                     }
                     else{
                         if(addr==globalRule->rules[index].args[i].arg_value_int){
                             // Shut down
-                            return 1;
+                            flag += 1;
                         }
                     }
+                }
+                if(flag == globalRule->rules[index].args_count){
+                    return 1;
                 }
             }
         }
@@ -683,7 +730,7 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                     break;
                 case ARGERROR:
                     // cmd's args illegal
-                    errorProcess("Cmds input args illegal!", SYNTAXINVALID);
+                    errorProcess("Cmds input args illegal!", EXECERROR);
                     break;
                 case MEANINGLESS:
                     // cmd non-executable
@@ -705,7 +752,6 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                 if(syscallBlock(pid, globalRule)){
                     struct user_regs_struct regs;
                     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-
                     errorProcess("Syscall block", SYSCALLBLOCK, getSyscallName(regs.orig_rax), getSyscallCount(regs.orig_rax), regs, pid);
                     kill(pid, SIGKILL);
                     finished++;
@@ -899,8 +945,13 @@ void commandAnalysis(char* input)
     // Determine how many commands aside pipes exist
     char** commands;
     int count=1;
+    int state = 0;
     for (char *p = input; *p; p++) {
-        if (*p == '|'){
+        if (*p == '\'' || *p == '\"'){
+            if (state==1) state=0;
+            else state=1;
+        }
+        if (*p == '|' && state==0){
             count++;
         }
     }
@@ -916,7 +967,7 @@ void commandAnalysis(char* input)
     int exitcode = extractCmds(input, commands, &count);
     if(exitcode == -1){
         // Extract space-key
-        errorProcess("extractCmds, catch space-key!", COMMANDNOTFOUND);
+        errorProcess("extractCmds, catch space-key!", EXECERROR);
         return;
     }
     else if(exitcode == -2){
@@ -958,8 +1009,6 @@ void commandAnalysis(char* input)
     }
 
     free(globalRule);
-
-
 }
 
 
