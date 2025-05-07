@@ -82,7 +82,8 @@ enum CHILDRETURN
     MATCHMISS=1,
     ARGERROR=2,
     MEANINGLESS=3,
-    RUNNINGERROR=4,     
+    RUNNINGERROR=4, 
+    INVALIDARR=5,   
 };
 const char version[10]="IamMI.v1";
 // Environment variables
@@ -93,6 +94,15 @@ typedef struct {
 } EnvVar;
 EnvVar my_env_vars[MAX_VARS];
 int var_count = 0;
+
+// Data type
+enum DataType
+{
+    INT=0,
+    STRING,
+    ADDR,
+};
+
 
 // Syscall Rule
 #define MAX_RULES 100
@@ -118,21 +128,22 @@ struct syscall_entry {
     const char* name;
     int number;
     int paramNum;
+    int paramType[6];
 };
 struct syscall_entry syscall_table[] = {
-    {"read", SYS_read, 3},
-    {"write", SYS_write, 3},
-    {"open", SYS_open, 3},
-    {"mmap", SYS_mmap, 6},
-    {"pipe", SYS_pipe, 1},
-    {"sched_yield", SYS_sched_yield, 0},
-    {"dup", SYS_dup, 1},
-    {"clone", SYS_clone, 5},
-    {"fork", SYS_fork, 0},
-    {"execve", SYS_execve, 1},
-    {"mkdir", SYS_mkdir, 2},
-    {"chmod", SYS_chmod, 2},
-    {NULL, -1, -1},
+    {"read", SYS_read, 3, {INT, STRING, INT}},
+    {"write", SYS_write, 3, {INT, STRING, INT}},
+    {"open", SYS_open, 3, {STRING, INT, INT}},
+    {"mmap", SYS_mmap, 6, {ADDR, INT, INT, INT, INT, INT}},
+    {"pipe", SYS_pipe, 1, {ADDR}},
+    {"sched_yield", SYS_sched_yield, 0, {}},
+    {"dup", SYS_dup, 1, {INT}},
+    {"clone", SYS_clone, 5, {ADDR, ADDR, INT, ADDR, ADDR}},
+    {"fork", SYS_fork, 0, {}},
+    {"execve", SYS_execve, 3, {STRING, ADDR, ADDR}},
+    {"mkdir", SYS_mkdir, 2, {STRING, INT}},
+    {"chmod", SYS_chmod, 2, {STRING, INT}},
+    {NULL, -1, -1, {}},
 };
 
 
@@ -140,146 +151,7 @@ struct syscall_entry syscall_table[] = {
 // Function
 //
 
-// Error Process
-
-int _isStringPointer(unsigned long addr) {
-    return addr > 0x10000 && addr < 0x7fffffffffff;
-}
-
-char* _readStringFromTracee(pid_t pid, unsigned long addr) {
-    static char buf[256];
-    memset(buf, 0, sizeof(buf));
-    int i = 0;
-    long word;
-
-    while (i < sizeof(buf)) {
-        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
-        if (word == -1) break;
-        memcpy(buf + i, &word, sizeof(word));
-        if (memchr(&word, 0, sizeof(word))) break;
-        i += sizeof(word);
-    }
-
-    char* result = malloc(300);
-    snprintf(result, 300, "\"%s\"", buf);
-    return result;
-}
-
-char* formatArg(pid_t pid, unsigned long val) {
-    char* result = malloc(64);
-
-    if (_isStringPointer(val)) {
-        char* str = _readStringFromTracee(pid, val);
-        if (str) return str;
-    }
-    
-    if (val <= 0xffff) {
-        snprintf(result, 64, "%lu", val);
-    } else {
-        snprintf(result, 64, "0x%lx", val);
-    }
-
-    return result;
-}
-
-void dispatchSyscallArgs(const char* syscall_name, struct user_regs_struct regs, int count, pid_t pid) {
-    char* args[6];
-    switch (count) {
-        case 6:
-            args[5] = formatArg(pid, regs.r9);
-        case 5:
-            args[4] = formatArg(pid, regs.r8);
-        case 4:
-            args[3] = formatArg(pid, regs.r10);
-        case 3:
-            args[2] = formatArg(pid, regs.rdx);
-        case 2:
-            args[1] = formatArg(pid, regs.rsi);
-        case 1:
-            args[0] = formatArg(pid, regs.rdi);
-        case 0:
-            break;
-        default:
-            printf("dispatchSyscallArgs error!\n");
-            return;
-    }
-
-    
-    switch (count) {
-        case 0:
-            print_blocked_syscall((char*)syscall_name, 0); break;
-        case 1:
-            print_blocked_syscall((char*)syscall_name, 1, args[0]); break;
-        case 2:
-            print_blocked_syscall((char*)syscall_name, 2, args[0], args[1]); break;
-        case 3:
-            print_blocked_syscall((char*)syscall_name, 3, args[0], args[1], args[2]); break;
-        case 4:
-            print_blocked_syscall((char*)syscall_name, 4, args[0], args[1], args[2], args[3]); break;
-        case 5:
-            print_blocked_syscall((char*)syscall_name, 5, args[0], args[1], args[2], args[3], args[4]); break;
-        case 6:
-            print_blocked_syscall((char*)syscall_name, 6, args[0], args[1], args[2], args[3], args[4], args[5]); break;
-    }
-
-    for (int i = 0; i < count; ++i) {
-        free(args[i]);
-    }
-}
-
-void errorProcess(char* pos,enum ERROR error,...)
-{
-    // 
-    //  To process all error
-    //
-    // printf("Sometime catch error: %s!\n", pos);
-    switch(error){
-        case SYNTAXINVALID:
-            print_invalid_syntax();
-            break;
-        case COMMANDNOTFOUND:
-            print_command_not_found();
-            break;
-        case EXECERROR:
-            print_execution_error();
-            break;
-        case SYSCALLBLOCK: {
-            va_list args;
-            va_start(args, error);
-            char* syscall_name = va_arg(args, char*);
-            int count = va_arg(args, int);
-            struct user_regs_struct regs = va_arg(args, struct user_regs_struct);
-            pid_t pid = va_arg(args, pid_t);
-
-            dispatchSyscallArgs(syscall_name, regs, count, pid);
-            va_end(args);
-            break;
-        }
-        default:
-            // Left for explore
-            break;
-    }
-}
-
-// jmp_buf __env;
-
-// void handler(int sig) {
-//     longjmp(__env, 1);
-// }
-
-// int is_pointer_valid(void *ptr) {
-//     signal(SIGSEGV, handler);
-//     if (setjmp(__env)) {
-//         // 非法访问
-//         return 0;
-//     } else {
-//         volatile char c = *(char *)ptr;
-//         (void)c;
-//         return 1;
-//     }
-// }
-
-// String process
+// Basic utils
 void trim(char *str) {
     int start = 0, end = strlen(str) - 1;
     while (isspace((unsigned char)str[start]) && start<=strlen(str) - 1) start++;
@@ -294,101 +166,14 @@ void trim(char *str) {
     }
 }
 
-int extractCmds(char *input, char **commands, int *count) {
-    // 
-    //  Because pipe is prior to redirection, thus extract cmds aside pipe 
-    //  Extract meta-cmd and trim it 
-    //
-    char *token = input;
-    int i = 0;
-
-    if(*count>1)
-        while (token) {
-            char *pipe_pos = strchr(token, '|');
-            if (pipe_pos) {
-                // Intermediate cmd
-                *pipe_pos = '\0'; 
-                commands[i] = strdup(token);
-                if(strlen(commands[i])==0){
-                    // Consective pipeline
-                    return -2;
-                }
-                trim(commands[i]);
-                if(strlen(commands[i])==0){
-                    // Blank cmd
-                    return -1;
-                }
-                token = pipe_pos + 1;
-            } else {
-                // last cmd
-                commands[i] = strdup(token);
-                trim(commands[i]);
-                if(strlen(commands[i])==0){
-                    // Blank cmd
-                    return -1;
-                }
-                break;
-            }
-            i++;
-        }
-    else{
-        // Only one cmd
-        commands[i] = strdup(token);
-        trim(commands[i]);
-        if(strlen(commands[i])==0){
-            // Blank cmd
-            *count = 0;
-        }
-    }
-
-    return 0;
-}
-
-void parseArgs(char *input, char **argv) {
-    //
-    //  For one cmd, extract cmd and its args
-    //
-    int argc = 0;
-    while (*input) {
-        while (isspace(*input)) input++;
-        if (*input == '\0') break;
-        if (*input == '"' || *input == '\'') {
-            char quote = *input++;
-            argv[argc++] = input;
-            while (*input && *input != quote) input++;
-            if (*input) *input++ = '\0'; 
-        } else {
-            argv[argc++] = input;
-            while (*input && !isspace(*input)) input++;
-            if (*input) *input++ = '\0'; 
-        }
-    }
-    argv[argc] = NULL;
-}
-
-void getDataFromChild(pid_t child, unsigned long addr, char *str, int pathlen) {
-    int i = 0;
-    long data;
-
-    while (i < pathlen) {
-        data = ptrace(PTRACE_PEEKDATA, child, addr + i, NULL);
-        if (data == -1 && errno != 0) break;
-        memcpy(str + i, &data, sizeof(data));
-
-        if (memchr(&data, 0, sizeof(data)) != NULL) break;  
-        i += sizeof(data);
-    }
-
-    str[pathlen - 1] = '\0'; 
-}
-
 // Syscall rule
 int loadRules(char* filename, RuleSet* globalRule) {
+    globalRule->rule_count = 0;
     FILE* fp = fopen(filename, "r");
     if (!fp) {
         return -1;
     }
-
+    
     char line[512];
     int flag = 0;
     while (fgets(line, sizeof(line), fp)) {
@@ -479,6 +264,15 @@ int getSyscallCount(int num){
     return -1;
 }
 
+int *getSyscallType(const char* name){
+    for (int i = 0; syscall_table[i].name != NULL; i++) {
+        if (strcmp(name, syscall_table[i].name) == 0) {
+            return syscall_table[i].paramType;
+        }
+    }
+    return NULL;
+}
+
 unsigned long getRegisterArg(int argIndex, struct user_regs_struct regs) {
     switch(argIndex) {
         case 0:
@@ -516,6 +310,195 @@ char *readStringFromPid(pid_t pid, unsigned long addr) {
     }
 
     return str;
+}
+
+// Error Process
+char* formatArg(pid_t pid, unsigned long val, int type) {
+    char* result = malloc(50);
+    switch(type){
+        case INT: 
+            sprintf(result, "%ld", val);
+            break;
+        case STRING:
+            sprintf(result, "\"%s\"", readStringFromPid(pid, val));
+            break;
+        case ADDR:
+            sprintf(result, "0x%lx", val);
+            break;
+        default:
+            break;
+    }
+
+    return result;
+}
+
+void dispatchSyscallArgs(const char* syscall_name, struct user_regs_struct regs, int count, pid_t pid) {
+    int* dataType = getSyscallType(syscall_name);
+
+    char* args[6];
+    switch (count) {
+        case 6:
+            args[5] = formatArg(pid, regs.r9, dataType[5]);
+        case 5:
+            args[4] = formatArg(pid, regs.r8, dataType[4]);
+        case 4:
+            args[3] = formatArg(pid, regs.r10, dataType[3]);
+        case 3:
+            args[2] = formatArg(pid, regs.rdx, dataType[2]);
+        case 2:
+            args[1] = formatArg(pid, regs.rsi, dataType[1]);
+        case 1:
+            args[0] = formatArg(pid, regs.rdi, dataType[0]);
+        case 0:
+            break;
+        default:
+            printf("dispatchSyscallArgs error!\n");
+            return;
+    }
+
+    
+    switch (count) {
+        case 0:
+            print_blocked_syscall((char*)syscall_name, 0); break;
+        case 1:
+            print_blocked_syscall((char*)syscall_name, 1, args[0]); break;
+        case 2:
+            print_blocked_syscall((char*)syscall_name, 2, args[0], args[1]); break;
+        case 3:
+            print_blocked_syscall((char*)syscall_name, 3, args[0], args[1], args[2]); break;
+        case 4:
+            print_blocked_syscall((char*)syscall_name, 4, args[0], args[1], args[2], args[3]); break;
+        case 5:
+            print_blocked_syscall((char*)syscall_name, 5, args[0], args[1], args[2], args[3], args[4]); break;
+        case 6:
+            print_blocked_syscall((char*)syscall_name, 6, args[0], args[1], args[2], args[3], args[4], args[5]); break;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        free(args[i]);
+    }
+}
+
+void errorProcess(char* pos,enum ERROR error,...)
+{
+    // 
+    //  To process all error
+    //
+    // printf("Sometime catch error: %s!\n", pos);
+    switch(error){
+        case SYNTAXINVALID:
+            print_invalid_syntax();
+            break;
+        case COMMANDNOTFOUND:
+            print_command_not_found();
+            break;
+        case EXECERROR:
+            print_execution_error();
+            break;
+        case SYSCALLBLOCK: {
+            va_list args;
+            va_start(args, error);
+            char* syscall_name = va_arg(args, char*);
+            int count = va_arg(args, int);
+            struct user_regs_struct regs = va_arg(args, struct user_regs_struct);
+            pid_t pid = va_arg(args, pid_t);
+
+            dispatchSyscallArgs(syscall_name, regs, count, pid);
+            va_end(args);
+            break;
+        }
+        default:
+            // Left for explore
+            break;
+    }
+}
+
+int extractCmds(char *input, char **commands, int *count) {
+    // 
+    //  Because pipe is prior to redirection, thus extract cmds aside pipe 
+    //  Extract meta-cmd and trim it 
+    //
+    char *token = input;
+    int i = 0;
+
+    if(*count>1)
+        while (token) {
+            char *pipe_pos = strchr(token, '|');
+            if (pipe_pos) {
+                // Intermediate cmd
+                *pipe_pos = '\0'; 
+                commands[i] = strdup(token);
+                if(strlen(commands[i])==0){
+                    // Consective pipeline
+                    return -2;
+                }
+                trim(commands[i]);
+                if(strlen(commands[i])==0){
+                    // Blank cmd
+                    return -1;
+                }
+                token = pipe_pos + 1;
+            } else {
+                // last cmd
+                commands[i] = strdup(token);
+                trim(commands[i]);
+                if(strlen(commands[i])==0){
+                    // Blank cmd
+                    return -1;
+                }
+                break;
+            }
+            i++;
+        }
+    else{
+        // Only one cmd
+        commands[i] = strdup(token);
+        trim(commands[i]);
+        if(strlen(commands[i])==0){
+            // Blank cmd
+            *count = 0;
+        }
+    }
+
+    return 0;
+}
+
+void parseArgs(char *input, char **argv) {
+    //
+    //  For one cmd, extract cmd and its args
+    //
+    int argc = 0;
+    while (*input) {
+        while (isspace(*input)) input++;
+        if (*input == '\0') break;
+        if (*input == '"' || *input == '\'') {
+            char quote = *input++;
+            argv[argc++] = input;
+            while (*input && *input != quote) input++;
+            if (*input) *input++ = '\0'; 
+        } else {
+            argv[argc++] = input;
+            while (*input && !isspace(*input)) input++;
+            if (*input) *input++ = '\0'; 
+        }
+    }
+    argv[argc] = NULL;
+}
+
+void getDataFromChild(pid_t child, unsigned long addr, char *str, int pathlen) {
+    int i = 0;
+    long data;
+
+    while (i < pathlen) {
+        data = ptrace(PTRACE_PEEKDATA, child, addr + i, NULL);
+        if (data == -1 && errno != 0) break;
+        memcpy(str + i, &data, sizeof(data));
+
+        if (memchr(&data, 0, sizeof(data)) != NULL) break;  
+        i += sizeof(data);
+    }
+
+    str[pathlen - 1] = '\0'; 
 }
 
 // Innercmd determine
@@ -739,6 +722,9 @@ void ParseChildReturn(pid_t* pids, int count, bool sandbox, RuleSet* globalRule)
                 case RUNNINGERROR:
                     errorProcess("Cmds running error!", EXECERROR);
                     break;
+                case INVALIDARR:
+                    errorProcess(" ", SYNTAXINVALID);
+                    break;
                 default:
                     errorProcess("New error occur at externalCmd!", EXECERROR);
                     break;
@@ -772,7 +758,7 @@ void externalCmd(char* cmd){
     // 1. Clean cmd    
     trim(cmd);
     // 2. Avoid inner instruction
-    if(innerCmdDeter(cmd)!=-1) exit(ENDUP);
+    if(innerCmdDeter(cmd)!=-1) exit(RUNNINGERROR);
     // 3. Find out redirection
     char* redirects[8] ;
     int redirect_count = 0;
@@ -792,7 +778,7 @@ void externalCmd(char* cmd){
         else if(*p == '>' && in_quote == 0){
             if(*(p+1)=='>'){
                 // ">>" -> Invalid syntax
-                exit(ARGERROR);
+                exit(INVALIDARR);
             }
             // ">" -> redirect
             // redirect_pos = p;
