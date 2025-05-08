@@ -166,6 +166,13 @@ void trim(char *str) {
     }
 }
 
+void sigpipeHandler(int signum) {
+    printf("hello\n");
+    if (signum == SIGPIPE) {
+        printf("Received SIGPIPE signal!\n");
+    }
+}
+
 // Syscall rule
 int loadRules(char* filename, RuleSet* globalRule) {
     globalRule->rule_count = 0;
@@ -317,7 +324,7 @@ char* formatArg(pid_t pid, unsigned long val, int type) {
     char* result = malloc(50);
     switch(type){
         case INT: 
-            sprintf(result, "%ld", val);
+            sprintf(result, "%lu", val);
             break;
         case STRING:
             sprintf(result, "\"%s\"", readStringFromPid(pid, val));
@@ -806,9 +813,15 @@ void externalCmd(char* cmd){
         }
         close(tmpfd); 
     }
-
+    
     parseArgs(cmd, argv); 
 
+    // Signal process
+    // if (signal(SIGPIPE, sigpipeHandler) == SIG_ERR) {
+    //     exit(RUNNINGERROR);
+    // }
+    
+    // Run code
     if (strcmp(argv[0], "env") == 0 && argv[1] == NULL) {
         // env
         env(NULL);
@@ -996,7 +1009,6 @@ void commandAnalysis(char* input)
 
     free(globalRule);
 }
-
 
 int main(void) 
 {   
